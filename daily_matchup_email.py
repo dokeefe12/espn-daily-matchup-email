@@ -3,7 +3,7 @@ import smtplib
 import requests
 from datetime import datetime
 from email.mime.text import MIMEText
-from pybaseball import statcast
+from urllib.parse import quote
 
 LEAGUE_ID = os.getenv("ESPN_LEAGUE_ID")
 YEAR = os.getenv("ESPN_YEAR", "2026")
@@ -12,8 +12,6 @@ SEND_TO_EMAIL = os.getenv("SEND_TO_EMAIL")
 
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
-
-SEASON_START_DATE = f"{YEAR}-03-01"
 
 ESPN_TEAM_ID_TO_ABBR = {
     1: "BAL", 2: "BOS", 3: "LAA", 4: "CWS", 5: "CLE",
@@ -47,15 +45,10 @@ def send_email(subject, body):
 
 def get_espn_league():
     url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/flb/seasons/{YEAR}/segments/0/leagues/{LEAGUE_ID}"
-
-    params = {
-        "view": ["mTeam", "mRoster", "mSettings"]
-    }
+    params = {"view": ["mTeam", "mRoster", "mSettings"]}
 
     response = requests.get(url, params=params, timeout=30)
-
     if response.status_code != 200:
-        print(response.text[:1000])
         raise Exception("Could not connect to ESPN league.")
 
     return response.json()
@@ -70,21 +63,42 @@ def get_my_team(league):
     raise Exception(f"Could not find ESPN team named {TEAM_NAME}. Available teams: {available}")
 
 
+def search_mlb_player_id(player_name):
+    if not player_name:
+        return None
+
+    url = f"https://statsapi.mlb.com/api/v1/people/search?names={quote(player_name)}"
+    response = requests.get(url, timeout=30)
+
+    if response.status_code != 200:
+        return None
+
+    people = response.json().get("people", [])
+
+    if not people:
+        return None
+
+    return people[0].get("id")
+
+
 def get_full_roster(team):
     players = []
 
     for entry in team.get("roster", {}).get("entries", []):
         player = entry.get("playerPoolEntry", {}).get("player", {})
 
+        name = player.get("fullName")
         espn_team_id = player.get("proTeamId")
         team_abbr = ESPN_TEAM_ID_TO_ABBR.get(espn_team_id, "UNKNOWN")
 
         lineup_slot = entry.get("lineupSlotId")
         is_bench = lineup_slot == 20
 
+        mlb_id = search_mlb_player_id(name)
+
         players.append({
-            "name": player.get("fullName"),
-            "batter_id": player.get("id"),
+            "name": name,
+            "batter_id": mlb_id,
             "team_abbr": team_abbr,
             "is_bench": is_bench
         })
@@ -96,7 +110,6 @@ def get_today_probable_pitchers():
     today = datetime.today().strftime("%Y-%m-%d")
 
     url = "https://statsapi.mlb.com/api/v1/schedule"
-
     params = {
         "sportId": 1,
         "date": today,
@@ -104,7 +117,6 @@ def get_today_probable_pitchers():
     }
 
     response = requests.get(url, params=params, timeout=30)
-
     if response.status_code != 200:
         raise Exception("Could not pull MLB probable pitchers.")
 
@@ -147,37 +159,84 @@ def get_today_probable_pitchers():
     return pitchers_by_team
 
 
-def get_statcast_data():
-    end_date = datetime.today().strftime("%Y-%m-%d")
-    return statcast(start_dt=SEASON_START_DATE, end_dt=end_date)
+def get_bvp_stats(batter_id, pitcher_id):
+    if not batter_id or not pitcher_id:
+        return {
+            "summary": "Missing player ID.",
+            "ab": 0,
+            "hr": 0,
+            "k": 0
+        }
+
+    url = f"https://statsapi.mlb.com/api/v1/people/{batter_id}"
+
+    params = {
+        "hydrate": f"stats(group=[hitting],type=[vsPlayer],opposingPlayerId={pitcher_id},sportId=1)"
+    }
+
+    response = requests.get(url, params=params, timeout=30)
+
+    if response.status_code != 200:
+        return {
+            "summary": "Could not pull MLB matchup stats.",
+            "ab": 0,
+            "hr": 0,
+            "k": 0
+        }
+
+    data = response.json()
+    people = data.get("people", [])
+
+    if not people:
+        return {
+            "summary": "No MLB player found.",
+            "ab": 0,
+            "hr": 0,
+            "k": 0
+        }
+
+    stats_blocks = people[0].get("stats", [])
+
+    if not stats_blocks:
+        return {
+            "summary": "No recorded matchup history.",
+            "ab": 0,
+            "hr": 0,
+            "k": 0
+        }
+
+    splits = stats_blocks[0].get("splits", [])
+
+    if not splits:
+        return {
+            "summary": "No recorded matchup history.",
+            "ab": 0,
+            "hr": 0,
+            "k": 0
+        }
+
+    stat = splits[0].get("stat", {})
+
+    ab = int(stat.get("atBats", 0))
+    hits = int(stat.get("hits", 0))
+    hr = int(stat.get("homeRuns", 0))
+    rbi = int(stat.get("rbi", 0))
+    avg = stat.get("avg", ".000")
+    ops = stat.get("ops", ".000")
+    k = int(stat.get("strikeOuts", 0))
+    bb = int(stat.get("baseOnBalls", 0))
+
+    summary = f"{hits} H, {hr} HR, {rbi} RBI, {ab} AB, AVG {avg}, OPS {ops}, {bb} BB, {k} K"
+
+    return {
+        "summary": summary,
+        "ab": ab,
+        "hr": hr,
+        "k": k
+    }
 
 
-def get_matchup_history(statcast_data, batter_id, pitcher_id):
-    matchup = statcast_data[
-        (statcast_data["batter"].astype(str) == str(batter_id)) &
-        (statcast_data["pitcher"].astype(str) == str(pitcher_id))
-    ]
-
-    if matchup.empty:
-        return "No recorded Statcast matchup history.", 0, 0, 0, 0
-
-    events = matchup.dropna(subset=["events"])
-
-    hits = events["events"].isin(["single", "double", "triple", "home_run"]).sum()
-    hr = (events["events"] == "home_run").sum()
-    k = (events["events"] == "strikeout").sum()
-    bb = events["events"].isin(["walk", "intent_walk"]).sum()
-
-    non_ab = ["walk", "intent_walk", "hit_by_pitch", "sac_fly", "sac_bunt", "catcher_interf"]
-    ab = len(events[~events["events"].isin(non_ab)])
-
-    avg = hits / ab if ab else 0
-
-    summary = f"{hits}-{ab}, {hr} HR, {bb} BB, {k} K, AVG {avg:.3f}"
-    return summary, ab, hr, k, bb
-
-
-def build_email(roster, pitchers_by_team, statcast_data):
+def build_email(roster, pitchers_by_team):
     today = datetime.today().strftime("%B %d, %Y")
 
     lines = [
@@ -206,20 +265,16 @@ def build_email(roster, pitchers_by_team, statcast_data):
         pitcher_id = matchup["pitcher_id"]
         opponent_team = matchup["opponent_team"]
 
-        summary, ab, hr, k, bb = get_matchup_history(
-            statcast_data,
-            player["batter_id"],
-            pitcher_id
-        )
+        history = get_bvp_stats(player["batter_id"], pitcher_id)
 
         lines.append(f"{name} ({bench_note}) vs {pitcher_name} ({opponent_team})")
-        lines.append(f"Career matchup: {summary}")
+        lines.append(f"Career matchup: {history['summary']}")
 
-        if ab >= 5 and hr > 0:
+        if history["ab"] >= 5 and history["hr"] > 0:
             lines.append("Quick read: Strong power history in this matchup.")
-        elif ab >= 5 and k >= 3:
+        elif history["ab"] >= 5 and history["k"] >= 3:
             lines.append("Quick read: Some strikeout risk here.")
-        elif ab == 0:
+        elif history["ab"] == 0:
             lines.append("Quick read: No direct matchup history.")
         else:
             lines.append("Quick read: Small sample. Use as light context.")
@@ -233,15 +288,9 @@ def main():
     league = get_espn_league()
     team = get_my_team(league)
     roster = get_full_roster(team)
-
     pitchers_by_team = get_today_probable_pitchers()
 
-    print("Pitchers by team:")
-    print(pitchers_by_team)
-
-    statcast_data = get_statcast_data()
-
-    body = build_email(roster, pitchers_by_team, statcast_data)
+    body = build_email(roster, pitchers_by_team)
 
     subject = f"Daily Fantasy Baseball Matchup Report - {datetime.today().strftime('%b %d')}"
 
