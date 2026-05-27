@@ -24,6 +24,15 @@ ESPN_TEAM_ID_TO_ABBR = {
     26: "SF", 27: "COL", 28: "MIA", 29: "ARI", 30: "TB"
 }
 
+MLB_ID_TO_ABBR = {
+    110: "BAL", 111: "BOS", 108: "LAA", 145: "CWS", 114: "CLE",
+    116: "DET", 118: "KC", 158: "MIL", 142: "MIN", 147: "NYY",
+    133: "OAK", 136: "SEA", 140: "TEX", 141: "TOR", 144: "ATL",
+    112: "CHC", 113: "CIN", 117: "HOU", 119: "LAD", 120: "WSH",
+    121: "NYM", 143: "PHI", 134: "PIT", 138: "STL", 135: "SD",
+    137: "SF", 115: "COL", 146: "MIA", 109: "ARI", 139: "TB"
+}
+
 
 def send_email(subject, body):
     msg = MIMEText(body)
@@ -37,10 +46,7 @@ def send_email(subject, body):
 
 
 def get_espn_league():
-    url = (
-        f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/flb/"
-        f"seasons/{YEAR}/segments/0/leagues/{LEAGUE_ID}"
-    )
+    url = f"https://lm-api-reads.fantasy.espn.com/apis/v3/games/flb/seasons/{YEAR}/segments/0/leagues/{LEAGUE_ID}"
 
     params = {
         "view": ["mTeam", "mRoster", "mSettings"]
@@ -55,16 +61,9 @@ def get_espn_league():
     return response.json()
 
 
-def clean_name(name):
-    return str(name).lower().strip()
-
-
 def get_my_team(league):
-    target = clean_name(TEAM_NAME)
-
     for team in league.get("teams", []):
-        espn_name = team.get("name", "")
-        if clean_name(espn_name) == target:
+        if str(team.get("name", "")).lower().strip() == TEAM_NAME.lower().strip():
             return team
 
     available = [team.get("name", "") for team in league.get("teams", [])]
@@ -77,20 +76,16 @@ def get_full_roster(team):
     for entry in team.get("roster", {}).get("entries", []):
         player = entry.get("playerPoolEntry", {}).get("player", {})
 
-        name = player.get("fullName")
-        batter_id = player.get("id")
         espn_team_id = player.get("proTeamId")
-        mlb_team_abbr = ESPN_TEAM_ID_TO_ABBR.get(espn_team_id, "UNKNOWN")
+        team_abbr = ESPN_TEAM_ID_TO_ABBR.get(espn_team_id, "UNKNOWN")
 
         lineup_slot = entry.get("lineupSlotId")
         is_bench = lineup_slot == 20
 
         players.append({
-            "name": name,
-            "batter_id": batter_id,
-            "espn_team_id": espn_team_id,
-            "mlb_team_abbr": mlb_team_abbr,
-            "lineup_slot": lineup_slot,
+            "name": player.get("fullName"),
+            "batter_id": player.get("id"),
+            "team_abbr": team_abbr,
             "is_bench": is_bench
         })
 
@@ -114,8 +109,7 @@ def get_today_probable_pitchers():
         raise Exception("Could not pull MLB probable pitchers.")
 
     data = response.json()
-
-    pitchers_by_team_abbr = {}
+    pitchers_by_team = {}
 
     for date_block in data.get("dates", []):
         for game in date_block.get("games", []):
@@ -127,64 +121,45 @@ def get_today_probable_pitchers():
             away_team = away.get("team", {})
             home_team = home.get("team", {})
 
-            away_abbr = away_team.get("abbreviation")
-            home_abbr = home_team.get("abbreviation")
+            away_id = away_team.get("id")
+            home_id = home_team.get("id")
 
-            away_pitcher = away.get("probablePitcher", {})
-            home_pitcher = home.get("probablePitcher", {})
+            away_abbr = MLB_ID_TO_ABBR.get(away_id)
+            home_abbr = MLB_ID_TO_ABBR.get(home_id)
+
+            away_pitcher = away.get("probablePitcher")
+            home_pitcher = home.get("probablePitcher")
 
             if away_abbr and home_pitcher:
-                pitchers_by_team_abbr[away_abbr] = {
-                    "opponent_pitcher_name": home_pitcher.get("fullName"),
-                    "opponent_pitcher_id": home_pitcher.get("id"),
+                pitchers_by_team[away_abbr] = {
+                    "pitcher_name": home_pitcher.get("fullName"),
+                    "pitcher_id": home_pitcher.get("id"),
                     "opponent_team": home_team.get("name")
                 }
 
             if home_abbr and away_pitcher:
-                pitchers_by_team_abbr[home_abbr] = {
-                    "opponent_pitcher_name": away_pitcher.get("fullName"),
-                    "opponent_pitcher_id": away_pitcher.get("id"),
+                pitchers_by_team[home_abbr] = {
+                    "pitcher_name": away_pitcher.get("fullName"),
+                    "pitcher_id": away_pitcher.get("id"),
                     "opponent_team": away_team.get("name")
                 }
 
-    return pitchers_by_team_abbr
+    return pitchers_by_team
 
 
-def get_all_statcast_data():
+def get_statcast_data():
     end_date = datetime.today().strftime("%Y-%m-%d")
-    print(f"Pulling Statcast data from {SEASON_START_DATE} to {end_date}")
     return statcast(start_dt=SEASON_START_DATE, end_dt=end_date)
 
 
-def get_batter_vs_pitcher_history(statcast_data, batter_id, pitcher_id):
-    if not batter_id or not pitcher_id:
-        return {
-            "pa": 0,
-            "ab": 0,
-            "hits": 0,
-            "hr": 0,
-            "k": 0,
-            "bb": 0,
-            "avg": 0,
-            "summary": "Missing batter or pitcher ID."
-        }
-
+def get_matchup_history(statcast_data, batter_id, pitcher_id):
     matchup = statcast_data[
         (statcast_data["batter"].astype(str) == str(batter_id)) &
         (statcast_data["pitcher"].astype(str) == str(pitcher_id))
     ]
 
     if matchup.empty:
-        return {
-            "pa": 0,
-            "ab": 0,
-            "hits": 0,
-            "hr": 0,
-            "k": 0,
-            "bb": 0,
-            "avg": 0,
-            "summary": "No recorded Statcast matchup history."
-        }
+        return "No recorded Statcast matchup history.", 0, 0, 0, 0
 
     events = matchup.dropna(subset=["events"])
 
@@ -193,30 +168,13 @@ def get_batter_vs_pitcher_history(statcast_data, batter_id, pitcher_id):
     k = (events["events"] == "strikeout").sum()
     bb = events["events"].isin(["walk", "intent_walk"]).sum()
 
-    non_ab_events = [
-        "walk",
-        "intent_walk",
-        "hit_by_pitch",
-        "sac_fly",
-        "sac_bunt",
-        "catcher_interf"
-    ]
-
-    ab = len(events[~events["events"].isin(non_ab_events)])
-    pa = len(events)
+    non_ab = ["walk", "intent_walk", "hit_by_pitch", "sac_fly", "sac_bunt", "catcher_interf"]
+    ab = len(events[~events["events"].isin(non_ab)])
 
     avg = hits / ab if ab else 0
 
-    return {
-        "pa": pa,
-        "ab": ab,
-        "hits": hits,
-        "hr": hr,
-        "k": k,
-        "bb": bb,
-        "avg": avg,
-        "summary": f"{hits}-{ab}, {hr} HR, {bb} BB, {k} K, AVG {avg:.3f}"
-    }
+    summary = f"{hits}-{ab}, {hr} HR, {bb} BB, {k} K, AVG {avg:.3f}"
+    return summary, ab, hr, k, bb
 
 
 def build_email(roster, pitchers_by_team, statcast_data):
@@ -233,39 +191,38 @@ def build_email(roster, pitchers_by_team, statcast_data):
 
     for player in roster:
         name = player["name"]
-        batter_id = player["batter_id"]
-        team_abbr = player["mlb_team_abbr"]
+        team_abbr = player["team_abbr"]
         bench_note = "Bench" if player["is_bench"] else "Active"
 
         matchup = pitchers_by_team.get(team_abbr)
 
         if not matchup:
             lines.append(f"{name} ({bench_note}) - {team_abbr}")
-            lines.append("No MLB probable pitcher found today, or player's team may be off.")
+            lines.append("No probable pitcher found today, or player's team may be off.")
             lines.append("")
             continue
 
-        pitcher_name = matchup["opponent_pitcher_name"]
-        pitcher_id = matchup["opponent_pitcher_id"]
+        pitcher_name = matchup["pitcher_name"]
+        pitcher_id = matchup["pitcher_id"]
         opponent_team = matchup["opponent_team"]
 
-        history = get_batter_vs_pitcher_history(
+        summary, ab, hr, k, bb = get_matchup_history(
             statcast_data,
-            batter_id,
+            player["batter_id"],
             pitcher_id
         )
 
         lines.append(f"{name} ({bench_note}) vs {pitcher_name} ({opponent_team})")
-        lines.append(f"Career matchup: {history['summary']}")
+        lines.append(f"Career matchup: {summary}")
 
-        if history.get("ab", 0) >= 5 and history.get("hr", 0) > 0:
+        if ab >= 5 and hr > 0:
             lines.append("Quick read: Strong power history in this matchup.")
-        elif history.get("ab", 0) >= 5 and history.get("k", 0) >= 3:
-            lines.append("Quick read: Some swing-and-miss risk here.")
-        elif history.get("pa", 0) == 0:
-            lines.append("Quick read: No direct matchup history. Use recent form and lineup spot as extra context.")
+        elif ab >= 5 and k >= 3:
+            lines.append("Quick read: Some strikeout risk here.")
+        elif ab == 0:
+            lines.append("Quick read: No direct matchup history.")
         else:
-            lines.append("Quick read: Small sample. Treat this as light context, not a lock.")
+            lines.append("Quick read: Small sample. Use as light context.")
 
         lines.append("")
 
@@ -279,10 +236,10 @@ def main():
 
     pitchers_by_team = get_today_probable_pitchers()
 
-    print("Probable pitchers by team:")
+    print("Pitchers by team:")
     print(pitchers_by_team)
 
-    statcast_data = get_all_statcast_data()
+    statcast_data = get_statcast_data()
 
     body = build_email(roster, pitchers_by_team, statcast_data)
 
